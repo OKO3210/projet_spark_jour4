@@ -151,6 +151,22 @@ def charger_movies(spark) -> DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Contrôle d'intégrité référentielle — orphelins
+# ---------------------------------------------------------------------------
+def controle_orphelins(ratings: DataFrame, movies: DataFrame) -> DataFrame:
+    """Détecte les ratings dont le movieId n'existe pas dans movies (left_anti join)."""
+    orphelins = ratings.join(F.broadcast(movies), "movieId", "left_anti")
+    nb_orphelins = orphelins.count()
+    print(f"Contrôle orphelins : {nb_orphelins} note(s) sans film correspondant.")
+
+    if nb_orphelins > 0:
+        orphelins.select("movieId").distinct().show()
+        return ratings.join(F.broadcast(movies.select("movieId")), "movieId", "left_semi")
+
+    return ratings
+
+
+# ---------------------------------------------------------------------------
 # Analyse 1 — agrégation : films les mieux notés (avec seuil de votes)
 # ---------------------------------------------------------------------------
 def analyse_films_mieux_notes(ratings: DataFrame) -> DataFrame:
@@ -234,6 +250,8 @@ def optimisation_broadcast(spark, films_agg: DataFrame, movies: DataFrame) -> No
 def transformation_et_analyses(spark) -> dict:
     ratings = charger_silver(spark)
     movies  = charger_movies(spark)
+
+    ratings = controle_orphelins(ratings, movies)
 
     a1 = analyse_films_mieux_notes(ratings)
     a2 = analyse_jointure_genres(a1, movies)
