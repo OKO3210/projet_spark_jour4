@@ -1,114 +1,132 @@
-"""Squelette de pipeline data pour le projet du jour 4.
+"""Pipeline data projet jour 4 — MovieLens ml-latest-small.
 
-Complétez les sections marquées TODO avec le jeu de données que vous avez choisi
-(taxi NYC multi-mois, DVF immobilier, accidents ONISR, ou MovieLens).
+Architecture : brut (bronze) -> nettoyé (silver, Parquet) -> agrégé (gold, résultats)
 
-Architecture cible (vue en cours) :
-    brut (bronze) -> nettoyé (silver, Parquet) -> agrégé (gold, résultats)
-
-Lancement, depuis la racine du projet :
+Lancement depuis la racine du projet :
     python starter-code/pipeline.py
-
-L'énoncé complet et la grille : projects/projet-jour-4.md
 """
+from __future__ import annotations
 
 import sys
 
-from pyspark.sql import functions as F
+from pyspark.sql import DataFrame, functions as F
+from pyspark.sql.types import (
+    DoubleType,
+    IntegerType,
+    LongType,
+    StringType,
+    StructField,
+    StructType,
+)
 from pyspark.sql.window import Window
 
 from spark_session import get_spark
 
-# Chemins. Adaptez-les au jeu de données que vous avez choisi.
-# Exemple taxi multi-mois : "data/datasets/yellow_tripdata_2024-*.parquet"
-DATA_BRUT = "data/datasets/yellow_tripdata_2024-01.parquet"
-ZONES_CSV = "data/datasets/taxi_zone_lookup.csv"
-SORTIE_SILVER = "data/output/clean"
-SORTIE_GOLD = "data/output/analyses"
+# ---------------------------------------------------------------------------
+# CONFIG — tous les chemins et seuils ici, aucun magic number ailleurs
+# ---------------------------------------------------------------------------
+RATINGS_CSV   = "ml-latest-small/ratings.csv"
+MOVIES_CSV    = "ml-latest-small/movies.csv"   # étape 2
+SORTIE_SILVER = "output/silver/ratings"
+SORTIE_GOLD   = "output/gold"
+RATING_MIN    = 0.5
+RATING_MAX    = 5.0
+COL_PARTITION = "annee_note"
+
+# Schéma explicite ratings.csv (jamais inferSchema)
+SCHEMA_RATINGS = StructType([
+    StructField("userId",    IntegerType(), nullable=False),
+    StructField("movieId",   IntegerType(), nullable=False),
+    StructField("rating",    DoubleType(),  nullable=False),
+    StructField("timestamp", LongType(),    nullable=False),
+])
 
 
-def ingestion(spark):
-    """Étape 1a : lire les données brutes.
-
-    TODO :
-    - Lire vos données brutes (Parquet : spark.read.parquet ; CSV : spark.read.csv).
-    - Pour du CSV, définir un SCHÉMA EXPLICITE (StructType) plutôt que inferSchema :
-      plus sûr et plus rapide. Mettre option("sep", ";") pour les CSV français.
-    - Inspecter : printSchema(), show(5), count().
-    """
-    df = spark.read.parquet(DATA_BRUT)
+# ---------------------------------------------------------------------------
+# Étape 1a — ingestion (bronze)
+# ---------------------------------------------------------------------------
+def ingestion(spark) -> DataFrame:
+    df = (
+        spark.read
+        .option("header", True)
+        .option("sep", ",")
+        .schema(SCHEMA_RATINGS)
+        .csv(RATINGS_CSV)
+    )
 
     df.printSchema()
     print("Lignes brutes :", df.count())
+    df.show(5)
     return df
 
 
-def nettoyage(df):
-    """Étape 1b : typer, dériver des colonnes, nettoyer (bronze -> silver).
+# ---------------------------------------------------------------------------
+# Étape 1b — nettoyage (bronze -> silver)
+# ---------------------------------------------------------------------------
+def nettoyage(df: DataFrame) -> DataFrame:
+    # colonnes dérivées
+    df = df.withColumn("date_note",  F.to_date(F.from_unixtime(F.col("timestamp"))))
+    df = df.withColumn(COL_PARTITION, F.year(F.col("date_note")))
 
-    TODO :
-    - Créer vos colonnes dérivées avec withColumn (durée, prix au km/m2, heure...).
-    - PROTÉGER les divisions : F.when(denominateur > 0, ...).otherwise(None).
-    - Filtrer les valeurs aberrantes (montants négatifs, distances/surfaces nulles,
-      dates incohérentes). Utiliser & | ~ (pas and/or/not) et parenthéser.
-    - Retirer les doublons (dropDuplicates) et gérer les manquants (na.drop/na.fill).
-    """
-    # Exemple (taxi) à remplacer ou compléter :
-    # df = df.withColumn(
-    #     "duree_min",
-    #     (F.col("tpep_dropoff_datetime").cast("long")
-    #      - F.col("tpep_pickup_datetime").cast("long")) / 60,
-    # )
-    # df = df.filter((F.col("duree_min") > 0) & (F.col("duree_min") < 180))
+    count_brut = df.count()
+    print(f"Avant nettoyage          : {count_brut:>7} lignes")
 
-    raise NotImplementedError(
-        "TODO nettoyage : dérivez vos colonnes et filtrez les valeurs aberrantes."
+    # manquants sur colonnes critiques
+    df = df.na.drop(subset=["userId", "movieId", "rating"])
+    count_apres_na = df.count()
+    print(f"Après na.drop            : {count_apres_na:>7} lignes  (écartées : {count_brut - count_apres_na})")
+
+    # une note unique par (user, film)
+    df = df.dropDuplicates(subset=["userId", "movieId"])
+    count_apres_dedup = df.count()
+    print(f"Après dropDuplicates     : {count_apres_dedup:>7} lignes  (écartées : {count_apres_na - count_apres_dedup})")
+
+    # notes hors bornes
+    df = df.filter(
+        (F.col("rating") >= RATING_MIN) & (F.col("rating") <= RATING_MAX)
+    )
+    count_apres_filtre = df.count()
+    print(f"Après filtre rating      : {count_apres_filtre:>7} lignes  (écartées : {count_apres_dedup - count_apres_filtre})")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Étape 1c — écriture silver
+# ---------------------------------------------------------------------------
+def ecrire_silver(spark, df: DataFrame) -> None:
+    df.write.mode("overwrite").partitionBy(COL_PARTITION).parquet(SORTIE_SILVER)
+    print("Couche silver écrite dans", SORTIE_SILVER)
+
+    # contrôle — relit le Parquet et vérifie la distribution par année (comme TP05)
+    silver_df = spark.read.parquet(SORTIE_SILVER)
+    silver_df.printSchema()
+    (
+        silver_df
+        .groupBy(COL_PARTITION)
+        .count()
+        .orderBy(COL_PARTITION)
+        .show()
     )
 
 
-def ecrire_silver(df):
-    """Étape 1c : écrire la couche intermédiaire nettoyée en Parquet.
-
-    TODO :
-    - Écrire en Parquet (write.mode("overwrite").parquet(SORTIE_SILVER)).
-    - Optionnel : partitionBy sur une colonne à FAIBLE cardinalité (mois, département,
-      année). Jamais sur une colonne à forte cardinalité (cela crée trop de fichiers).
-    """
-    df.write.mode("overwrite").parquet(SORTIE_SILVER)
-    print("Couche silver écrite dans", SORTIE_SILVER)
-
-
-def transformation_et_analyses(spark):
-    """Étape 2 : relire le propre, puis 3 analyses (silver -> gold).
-
-    On relit la couche Parquet nettoyée (pas les données brutes).
-
-    TODO : produire AU MOINS TROIS analyses, dont :
-    - une AGRÉGATION (groupBy + agg) ;
-    - une JOINTURE (join, idéalement avec F.broadcast sur la petite table) ;
-    - une WINDOW FUNCTION (Window.partitionBy(...).orderBy(...), row_number/rank/lag).
-    Et au moins UNE OPTIMISATION justifiée : broadcast, cache, ou repartition.
-    """
+# ---------------------------------------------------------------------------
+# Étape 2 — analyses (silver -> gold)  [TODO étape 2]
+# ---------------------------------------------------------------------------
+def transformation_et_analyses(spark) -> dict:
     df = spark.read.parquet(SORTIE_SILVER)
 
-    # Optimisation cache : utile UNIQUEMENT si df est réutilisé par plusieurs analyses.
     df = df.cache()
     df.count()  # matérialise le cache
 
-    # --- Analyse 1 : agrégation -------------------------------------------------
-    # TODO : groupBy(...).agg(F.count, F.avg, F.sum...) sur une question métier.
-    analyse_1 = None
+    # --- Analyse 1 : agrégation ------------------------------------------------
+    analyse_1 = None  # TODO
 
-    # --- Analyse 2 : jointure ---------------------------------------------------
-    # TODO : charger une table de référence et la joindre.
-    # Pensez à F.broadcast(petite_table) pour éviter un shuffle.
-    analyse_2 = None
+    # --- Analyse 2 : jointure --------------------------------------------------
+    analyse_2 = None  # TODO
 
-    # --- Analyse 3 : window function -------------------------------------------
-    # TODO : classement / cumul / moyenne glissante par groupe.
-    # fenetre = Window.partitionBy("groupe").orderBy(F.desc("metrique"))
-    # ... .withColumn("rang", F.row_number().over(fenetre)).filter(F.col("rang") <= 10)
-    analyse_3 = None
+    # --- Analyse 3 : window function ------------------------------------------
+    analyse_3 = None  # TODO
 
     if analyse_1 is None or analyse_2 is None or analyse_3 is None:
         raise NotImplementedError(
@@ -118,38 +136,32 @@ def transformation_et_analyses(spark):
     return {"analyse_1": analyse_1, "analyse_2": analyse_2, "analyse_3": analyse_3}
 
 
-def ecrire_gold(resultats):
-    """Étape 3 : écrire les résultats de synthèse.
-
-    TODO :
-    - Écrire chaque résultat (Parquet ou CSV). coalesce(1) est acceptable ICI car les
-      résultats agrégés sont PETITS. Ne jamais coalesce(1) un gros DataFrame.
-    """
+# ---------------------------------------------------------------------------
+# Étape 3 — écriture gold  [TODO étape 2]
+# ---------------------------------------------------------------------------
+def ecrire_gold(resultats: dict) -> None:
     for nom, df in resultats.items():
         chemin = f"{SORTIE_GOLD}/{nom}"
         df.coalesce(1).write.mode("overwrite").parquet(chemin)
         print("Résultat écrit :", chemin)
 
 
-def main():
-    spark = get_spark("Projet Jour 4 - Mon pipeline")
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> None:
+    spark = get_spark("Projet Jour 4 - MovieLens")
     print("Spark UI disponible sur http://localhost:4040")
 
-    # Étape 1 : ingestion et nettoyage (bronze -> silver)
-    brut = ingestion(spark)
+    brut   = ingestion(spark)
     propre = nettoyage(brut)
-    ecrire_silver(propre)
+    ecrire_silver(spark, propre)
 
-    # Étape 2 : transformation et analyses (silver -> gold)
-    resultats = transformation_et_analyses(spark)
+    # Décommenter pour étape 2 :
+    # resultats = transformation_et_analyses(spark)
+    # ecrire_gold(resultats)
 
-    # Étape 3 : finalisation
-    ecrire_gold(resultats)
-
-    # Garder la session vivante pour explorer la Spark UI.
-    # Décommentez la ligne suivante si le pipeline se termine trop vite :
-    # input("Spark UI sur http://localhost:4040 - Entree pour quitter...")
-
+    input("Spark UI sur http://localhost:4040 — Entrée pour quitter...")
     spark.stop()
 
 
