@@ -216,3 +216,28 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+@"
+
+# === Spark / Projet Jour 4 ===
+# Données brutes et volumineuses (jamais commitées)
+data/
+ml-latest-small/
+*.csv
+*.csv.gz
+
+# Sorties Spark (silver / gold régénérables)
+output/
+spark-warehouse/
+metastore_db/
+derby.log
+
+# Artefacts Parquet / Spark
+*.parquet
+*.crc
+_SUCCESS
+
+# Secrets
+.env
+"@ | Out-File -FilePath .gitignore -Append -Encoding utf8
