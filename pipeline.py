@@ -3,7 +3,7 @@
 Architecture : brut (bronze) -> nettoyé (silver, Parquet) -> agrégé (gold, résultats)
 
 Lancement depuis la racine du projet :
-    python starter-code/pipeline.py
+    python pipeline.py
 """
 from __future__ import annotations
 
