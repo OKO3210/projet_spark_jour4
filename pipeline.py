@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import sys
 import time
+from typing import Callable
 
-from pyspark.sql import DataFrame, functions as F
+from pyspark.sql import DataFrame, SparkSession, functions as F
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
@@ -35,6 +36,8 @@ RATING_MAX    = 5.0
 COL_PARTITION = "annee_note"
 SEUIL_VOTES   = 50
 TOP_N         = 3
+BROADCAST_THRESHOLD_DISABLED = -1
+BROADCAST_THRESHOLD_DEFAUT   = 10 * 1024 * 1024   # 10 MiB, défaut Spark
 
 # Schémas explicites (jamais inferSchema)
 SCHEMA_RATINGS = StructType([
@@ -54,7 +57,7 @@ SCHEMA_MOVIES = StructType([
 # ---------------------------------------------------------------------------
 # Utilitaire chrono (comme TP08)
 # ---------------------------------------------------------------------------
-def chrono(label: str, fn) -> None:
+def chrono(label: str, fn: Callable[[], object]) -> None:
     debut = time.perf_counter()
     fn()
     duree = time.perf_counter() - debut
@@ -64,7 +67,7 @@ def chrono(label: str, fn) -> None:
 # ---------------------------------------------------------------------------
 # Étape 1a — ingestion (bronze)
 # ---------------------------------------------------------------------------
-def ingestion(spark) -> DataFrame:
+def ingestion(spark: SparkSession) -> DataFrame:
     df = (
         spark.read
         .option("header", True)
@@ -110,7 +113,7 @@ def nettoyage(df: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 # Étape 1c — écriture silver
 # ---------------------------------------------------------------------------
-def ecrire_silver(spark, df: DataFrame) -> None:
+def ecrire_silver(spark: SparkSession, df: DataFrame) -> None:
     df.write.mode("overwrite").partitionBy(COL_PARTITION).parquet(SORTIE_SILVER)
     print("Couche silver écrite dans", SORTIE_SILVER)
 
@@ -129,7 +132,7 @@ def ecrire_silver(spark, df: DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # Étape 2a — chargement silver (avec cache, réutilisée par 3 analyses)
 # ---------------------------------------------------------------------------
-def charger_silver(spark) -> DataFrame:
+def charger_silver(spark: SparkSession) -> DataFrame:
     df = spark.read.parquet(SORTIE_SILVER)
     df = df.cache()
     df.count()  # matérialise le cache
@@ -139,7 +142,7 @@ def charger_silver(spark) -> DataFrame:
 # ---------------------------------------------------------------------------
 # Étape 2b — chargement movies
 # ---------------------------------------------------------------------------
-def charger_movies(spark) -> DataFrame:
+def charger_movies(spark: SparkSession) -> DataFrame:
     df = (
         spark.read
         .option("header", True)
@@ -221,25 +224,25 @@ def analyse_top_par_genre(films_enrichis: DataFrame) -> DataFrame:
 # ---------------------------------------------------------------------------
 # Optimisation mesurée — broadcast vs sort-merge join
 # ---------------------------------------------------------------------------
-def optimisation_broadcast(spark, films_agg: DataFrame, movies: DataFrame) -> None:
+def optimisation_broadcast(spark: SparkSession, films_agg: DataFrame, movies: DataFrame) -> None:
     print("\n=== Optimisation : broadcast vs sort-merge join ===")
 
     # a) sort-merge join (shuffle forcé)
-    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", str(BROADCAST_THRESHOLD_DISABLED))
     join_shuffle = films_agg.join(movies, "movieId")
     chrono("join sort-merge (shuffle)", lambda: join_shuffle.count())
     print("-- Plan sort-merge (doit montrer SortMergeJoin + Exchange) :")
     join_shuffle.explain()
 
     # b) broadcast join
-    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)  # seuil toujours désactivé
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", str(BROADCAST_THRESHOLD_DISABLED))
     join_broadcast = films_agg.join(F.broadcast(movies), "movieId")
     chrono("join broadcast", lambda: join_broadcast.count())
     print("-- Plan broadcast (doit montrer BroadcastHashJoin, pas d'Exchange) :")
     join_broadcast.explain()
 
     # restaure le seuil par défaut (10 MiB)
-    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 10485760)
+    spark.conf.set("spark.sql.autoBroadcastJoinThreshold", str(BROADCAST_THRESHOLD_DEFAUT))
 
     print("Compare les plans : SortMergeJoin+Exchange vs BroadcastHashJoin.")
 
@@ -247,7 +250,7 @@ def optimisation_broadcast(spark, films_agg: DataFrame, movies: DataFrame) -> No
 # ---------------------------------------------------------------------------
 # Étape 2 — orchestration analyses (silver -> gold)
 # ---------------------------------------------------------------------------
-def transformation_et_analyses(spark) -> dict:
+def transformation_et_analyses(spark: SparkSession) -> dict[str, DataFrame]:
     ratings = charger_silver(spark)
     movies  = charger_movies(spark)
 
