@@ -1,4 +1,0 @@
-# Dependances du projet Jour 4.
-# PySpark embarque Spark : aucune installation separee de Spark n'est necessaire.
-# Spark 4 exige Python 3.9 ou superieur et Java 17 ou superieur.
-pyspark>=4.0.0
